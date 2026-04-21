@@ -1,0 +1,294 @@
+#include <xc.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+
+// ---------- PIN DEFINES ----------
+#define SA1_PIN PC1
+#define SA2_PIN PC2
+#define SA3_PIN PC3
+#define SER     PD3
+#define SRCLK   PB0
+#define RCLK    PB2
+
+// ---------- ENUM STATE ----------
+enum CLOCK_STATE {
+    DISPLAY_HHMM,
+    DISPLAY_MMSS,
+    TIMESETMODE_HH,
+    TIMESETMODE_MM,
+    INCREMENT,
+    DECREMENT
+};
+volatile enum CLOCK_STATE clockState = DISPLAY_HHMM;
+
+// ---------- GLOBAL VARIABLES ----------
+volatile uint16_t milliseconds = 0;
+volatile uint16_t seconds = 0;
+volatile uint8_t minutes = 0;
+volatile uint8_t hours = 12;
+volatile uint8_t isPM = 0;
+uint8_t digits[5] = {0};
+
+volatile uint16_t tickLimit = 1000;
+volatile uint8_t current_digit = 0;  // for display refresh
+
+volatile uint16_t colon_timer = 0;
+volatile uint8_t colon_on = 0;
+
+const uint8_t SEGMENT_MAP[] = {
+    0x3F, 0x06, 0x5B, 0x4F,
+    0x66, 0x6D, 0x7D, 0x07,
+    0x7F, 0x6F, 0x77, 0x7C,
+    0x39, 0x5E, 0x79, 0x71,
+    0x00, 0x40
+};
+
+// ---------- TIMER0 SETUP ----------
+void timer0setup() {
+    TCCR0A = 0b00000010;
+    TCCR0B = 0b00000011;
+    OCR0A = 249;
+    TIMSK0 |= 0b00000010;
+}
+
+// ---------- ADC SETUP ----------
+void adcSetup() {
+    ADMUX = 0b01000000;
+    ADCSRA = 0b10000111;
+}
+
+uint16_t readADC() {
+    ADCSRA |= 0b01000000;
+    while (ADCSRA & 0b01000000);
+    return ADC;
+}
+
+// ---------- IO SETUP ----------
+void setup_io() {
+    DDRC &= ~(0b00001110);
+    PORTC |= 0b00001110;
+
+    DDRD |= 0b00001000;
+    DDRB |= 0b00000101;
+}
+
+// ---------- SHIFT REGISTER ----------
+void shiftOut(uint8_t val) {
+    for (uint8_t i = 0; i < 8; i++) {
+        if (val & 0b10000000) PORTD |= 0b00001000;
+        else PORTD &= ~0b00001000;
+        PORTB |= 0b00000001;
+        PORTB &= ~0b00000001;
+        val <<= 1;
+    }
+}
+
+void sendData(uint8_t segments, uint8_t digit_index) {
+    PORTB &= ~0b00000100;
+    shiftOut(segments);
+    shiftOut(~(0b00000001 << digit_index));
+    PORTB |= 0b00000100;
+    PORTB &= ~0b00000100;
+}
+
+// ---------- STATE MACHINE ----------
+void processStateMachine() {
+    static uint8_t sa1_last = 1, sa2_last = 1, sa3_last = 1;
+    static uint8_t sa1_stable = 1, sa2_stable = 1, sa3_stable = 1;
+    static uint8_t sa1_count = 0, sa2_count = 0, sa3_count = 0;
+
+    uint8_t sa1_now = (PINC & 0b00000010) != 0;
+    uint8_t sa2_now = (PINC & 0b00000100) != 0;
+    uint8_t sa3_now = (PINC & 0b00001000) != 0;
+
+    // Debounce SA1
+    if (sa1_now == sa1_stable) {
+        sa1_count = 0;
+    } else {
+        if (++sa1_count >= 5) {
+            sa1_stable = sa1_now;
+            sa1_count = 0;
+        }
+    }
+
+    // Debounce SA2
+    if (sa2_now == sa2_stable) {
+        sa2_count = 0;
+    } else {
+        if (++sa2_count >= 5) {
+            sa2_stable = sa2_now;
+            sa2_count = 0;
+        }
+    }
+
+    // Debounce SA3
+    if (sa3_now == sa3_stable) {
+        sa3_count = 0;
+    } else {
+        if (++sa3_count >= 5) {
+            sa3_stable = sa3_now;
+            sa3_count = 0;
+        }
+    }
+
+    // State transitions using debounced edge detection
+    switch (clockState) {
+        case DISPLAY_HHMM:
+        case DISPLAY_MMSS:
+            if (!sa3_stable && sa3_last) {
+                clockState = (clockState == DISPLAY_HHMM) ? DISPLAY_MMSS : DISPLAY_HHMM;
+            }
+            if (!sa1_stable && sa1_last) {
+                clockState = TIMESETMODE_HH;
+            }
+            break;
+
+        case TIMESETMODE_HH:
+            if (!sa1_stable && sa1_last) {
+                clockState = TIMESETMODE_MM;
+            }
+            if (!sa2_stable && sa2_last) {
+                hours = (hours % 12) + 1;
+                if (hours == 12) {
+                    isPM ^= 1;
+                }
+            }
+            if (!sa3_stable && sa3_last) {
+                if (hours == 1) {
+                    hours = 12;
+                    isPM ^= 1;
+                } else {
+                    hours--;
+                }
+            }
+            break;
+
+        case TIMESETMODE_MM:
+            if (!sa1_stable && sa1_last) {
+                seconds = 0;
+                clockState = DISPLAY_HHMM;
+            }
+            if (!sa2_stable && sa2_last) {
+                minutes = (minutes + 1) % 60;
+            }
+            if (!sa3_stable && sa3_last) {
+                minutes = (minutes == 0) ? 59 : minutes - 1;
+            }
+            break;
+    }
+
+    sa1_last = sa1_stable;
+    sa2_last = sa2_stable;
+    sa3_last = sa3_stable;
+}
+
+
+// ---------- CLOCK LOGIC ----------
+void updateClock() {
+    uint16_t adcValue = readADC();
+    tickLimit = 10 + ((uint32_t)(adcValue) * 990) / 1023;
+
+    if (milliseconds >= tickLimit) {
+        milliseconds = 0;
+        if (clockState == DISPLAY_HHMM || clockState == DISPLAY_MMSS) {
+            seconds++;
+            if (seconds >= 60) {
+                seconds = 0;
+                minutes++;
+                if (minutes >= 60) {
+                    minutes = 0;
+                    if (hours == 11) {
+                        isPM ^= 1; // toggle AM/PM when going from 11:59 to 12:00
+                    }
+                    hours++;
+                    if (hours > 12) {
+                        hours = 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- DISPLAY DIGITS ----------
+void updateDigits() {
+    if (clockState == DISPLAY_MMSS) {
+        digits[0] = minutes / 10;
+        digits[1] = minutes % 10;
+        digits[2] = seconds / 10;
+        digits[3] = seconds % 10;
+    } else if (clockState == TIMESETMODE_HH) {
+        digits[0] = (hours < 10) ? 16 : hours / 10;
+        digits[1] = hours % 10;
+        digits[2] = 16;
+        digits[3] = 16;
+    } else if (clockState == TIMESETMODE_MM) {
+        digits[0] = 16;
+        digits[1] = 16;
+        digits[2] = minutes / 10;
+        digits[3] = minutes % 10;
+    } else {
+        digits[0] = (hours < 10) ? 16 : hours / 10;
+        digits[1] = hours % 10;
+        digits[2] = minutes / 10;
+        digits[3] = minutes % 10;
+    }
+}
+
+void refreshDisplay() {
+    static uint8_t control_update_counter = 0;
+    uint8_t seg = SEGMENT_MAP[digits[current_digit]];
+
+    if (clockState == DISPLAY_MMSS && current_digit == 1) {
+        seg |= 0b10000000; // Decimal point
+    }
+
+    sendData(seg, current_digit);
+
+    current_digit++;
+    if (current_digit >= 4) {
+        current_digit = 0;
+        control_update_counter++;
+        if (control_update_counter >= 2) {
+            control_update_counter = 0;
+            uint8_t control = 0x00;
+            if (clockState == DISPLAY_HHMM && colon_on) {
+                control |= 0b00000011; // Semicolon dots
+            }
+            if (isPM && clockState == DISPLAY_HHMM) {
+                control |= 0b00000100; // PM dot on L3
+            }
+            sendData(control, 4); // Digit 5
+        }
+    }
+}
+
+// ---------- SETUP ----------
+void setup() {
+    setup_io();
+    timer0setup();
+    adcSetup();
+    sei();
+}
+
+// ---------- ISR ----------
+ISR(TIMER0_COMPA_vect) {
+    milliseconds++;
+    refreshDisplay();
+
+    colon_timer++;
+    if (colon_timer >= 1000) {
+        colon_timer = 0;
+        colon_on ^= 1;
+    }
+}
+
+// ---------- MAIN ----------
+void main(void) {
+    setup();
+    while (1) {
+        updateClock();
+        processStateMachine();
+        updateDigits();
+    }
+}
